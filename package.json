@@ -1,0 +1,22 @@
+{
+  "name": "creative-studio-desktop-dev",
+  "productName": "Creative Studio Dev",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal creative studio — Electron development shell",
+  "main": "main/index.cjs",
+  "scripts": {
+    "postinstall": "node scripts/install-runtime.cjs",
+    "dev": "node scripts/start.cjs --dev",
+    "start": "node scripts/start.cjs",
+    "test": "node tests/desktop.cjs && node tests/engineering.cjs",
+    "test:settings": "node tests/settings-window.cjs"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "devDependencies": {
+    "electron": "43.8.10",
+    "playwright-core": "1.58.2"
+  }
+}

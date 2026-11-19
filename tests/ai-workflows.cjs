@@ -1,0 +1,100 @@
+﻿const {_electron:electron}=require('playwright-core');
+const assert=require('node:assert/strict'),http=require('node:http'),path=require('node:path');
+const root=path.resolve(__dirname,'..');
+const env={...process.env,STUDIO_TEST_PROFILE:path.join(root,'.test-data','ai-workflows-'+Date.now())};delete env.ELECTRON_RUN_AS_NODE;
+let app,server,reply='',calls=0,finish='stop';
+(async()=>{
+ server=http.createServer(async(req,res)=>{let raw='';for await(const part of req)raw+=part;calls++;const content=typeof reply==='function'?reply(JSON.parse(raw)):reply;res.setHeader('Content-Type','text/event-stream');res.end('data: '+JSON.stringify({choices:[{delta:{content},finish_reason:finish}]})+'\n\ndata: [DONE]\n\n');});
+ await new Promise(r=>server.listen(0,'127.0.0.1',r));
+ app=await electron.launch({executablePath:require('electron'),args:[root,'--dev'],env});
+ const p=await app.firstWindow();await p.waitForFunction(()=>window.StudioTasks&&window.CreationWorkflow);
+ await p.evaluate(base=>{
+  store.apiConnections.push({id:'workflow-test',name:'Fixture',provider:'openai-compatible',baseUrl:base+'/v1',enabled:true,models:[{id:'fixture'}]});
+  store.globalModelConfig={...store.globalModelConfig,connectionId:'workflow-test',modelId:'fixture'};
+  for(const f of Object.values(store.featureAllocations||{})){delete f.connectionId;delete f.modelId;}
+  save();
+ },'http://127.0.0.1:'+server.address().port);
+ reply=JSON.stringify({operations:[{kind:'add',name:'Fixture new tag'}]});
+ const tag=await p.evaluate(async()=>{
+  const input=document.createElement('textarea');input.id='tagCommand';input.value='add a test tag';document.body.append(input);
+  const before=store.tagItems.length;await planTagAI();const preview=structuredClone(ui.preview);const unchanged=store.tagItems.length===before;applyAIPlan();
+  return {preview,unchanged,exists:store.tagItems.some(t=>t.name==='Fixture new tag')};
+ });assert.equal(tag.unchanged,true);assert.equal(tag.exists,true);assert.equal(tag.preview.length,1);
+ reply='invalid json';await p.evaluate(async()=>{const input=document.createElement('textarea');input.id='tagCommand';input.value='bad';document.body.append(input);await planTagAI();});
+ assert.equal(await p.evaluate(()=>ui.preview.length),0);
+ console.log('PASS actual tag request, preview/adoption and malformed output isolation');
+ await p.evaluate(()=>{startRpForRole(store.roles[0].id);CreationWorkflow.getRp(ui.rpSessionId).modelOverride={connectionId:'workflow-test',modelId:'fixture'};save();});
+ reply=JSON.stringify({directions:Array.from({length:4},(_,i)=>({title:'Direction '+i,desc:'Reason '+i,action:'Action '+i}))});
+ await p.evaluate(()=>v3RerollDeductions());assert.equal(await p.evaluate(()=>v3GetRpAux().deductions.length),4);
+ const count=await p.evaluate(()=>CreationWorkflow.getRp(ui.rpSessionId).messages.length);
+ reply='Actual isolated trial';await p.evaluate(()=>v3PreviewDeduction(0));
+ assert.equal(await p.evaluate(()=>CreationWorkflow.getRp(ui.rpSessionId).messages.length),count);
+ await p.evaluate(()=>v3AdoptDeduction(0));assert.equal(await p.evaluate(()=>CreationWorkflow.getRp(ui.rpSessionId).messages.at(-1).text),reply);
+ await p.reload();await p.waitForFunction(()=>window.CreationWorkflow);
+ assert.equal(await p.evaluate(()=>Object.values(store.rpSessions).flat().some(s=>s.messages.some(m=>m.text==='Actual isolated trial'))),true);
+ console.log('PASS four network directions, isolated trial, explicit adoption and refresh persistence');
+ await p.evaluate(()=>visit('concept'));
+ await p.locator('#generateBtn').click();
+ await p.locator('#batchAIBtn').evaluate(el=>{for(let n=el.parentElement;n;n=n.parentElement)if(n.tagName==='DETAILS')n.open=true;});
+ await p.locator('#batchAIBtn').click();
+ const candidate=await p.evaluate(()=>ConceptWorkbench.getState().candidates[0]);
+ reply=JSON.stringify({branches:[],candidates:[{baseId:candidate.id,title:'Fixture concept',description:'Actual generated description',newTags:[]}]});
+ await p.locator('#generateBatchRemote').click();
+ await p.waitForFunction(()=>document.getElementById('batchResult')?.value.includes('Fixture concept'));
+ assert.notEqual(await p.evaluate(()=>ConceptWorkbench.getState().candidates[0].narrative.title),'Fixture concept');
+ await p.locator('#importBatchAI').click();
+ assert.equal(await p.evaluate(()=>ConceptWorkbench.getState().candidates[0].narrative.title),'Fixture concept');
+ console.log('PASS concept remote generation previews before explicit import');
+ await p.evaluate(()=>{ConceptWorkbench.getState().mode='creative';ConceptWorkbench.getState().count=2;});
+ reply=body=>{const input=body.messages.at(-1).content;const ids=[...input.matchAll(/"baseId":\s*"([^"]+)"/g)].map(m=>m[1]).filter(v=>v!=='C001');return JSON.stringify({branches:[],candidates:ids.map(baseId=>({baseId,title:'Direct AI',description:'Direct generated card',newTags:[]}))});};
+ await p.locator('#generateBtn').click();
+ await p.waitForFunction(()=>ConceptWorkbench.getState().candidates.filter(c=>!c.saved).every(c=>c.narrative.title==='Direct AI'));
+ assert.equal(await p.locator('#batchResult').isVisible(),false);
+ console.log('PASS direct AI cards without import dialog');
+ const batchReply=body=>{
+   assert.ok(body.max_tokens>=8192);
+   const ids=[...body.messages.at(-1).content.matchAll(/"baseId":\s*"([^"]+)"/g)].map(m=>m[1]).filter(v=>v!=='C001');
+   assert.ok(ids.length<=2);
+   return JSON.stringify({branches:[],candidates:ids.map(baseId=>({baseId,title:'Batch AI',description:'较长的真实格式测试描述。'.repeat(150),newTags:[]}))});
+ };
+ for(const count of [4,16]){
+   await p.evaluate(n=>ConceptWorkbench.getState().count=n,count);
+   reply=batchReply;const beforeCalls=calls;await p.locator('#generateBtn').click();
+   await p.waitForFunction(n=>ConceptWorkbench.getState().candidates.filter(c=>!c.saved).length===n&&!document.getElementById('generateBtn').disabled,count);
+   assert.equal(calls-beforeCalls,count/2);
+ }
+ let part=0;reply=body=>{part++;finish=part===2?'length':'stop';return batchReply(body)};
+ await p.evaluate(()=>ConceptWorkbench.getState().count=4);
+ await p.locator('#generateBtn').click();await p.waitForFunction(()=>!document.getElementById('generateBtn').disabled);
+ assert.equal(await p.evaluate(()=>ConceptWorkbench.getState().candidates.filter(c=>!c.saved).length),2);
+ assert.equal(await p.evaluate(()=>CreationWorkflow.listRequests().at(-1).status),'incomplete');
+ finish='stop';
+ await p.reload();await p.waitForFunction(()=>window.ConceptWorkbench&&window.CreationWorkflow);
+ assert.equal(await p.evaluate(()=>ConceptWorkbench.getState().candidates.filter(c=>!c.saved).length),2);
+ console.log('PASS 4/16 candidates in bounded batches; truncated second batch preserves first after reload');
+ await p.evaluate(()=>{startRpForRole(store.roles[0].id);const s=getRpSessionById(ui.rpSessionId);s.modelOverride={connectionId:'workflow-test',modelId:'fixture'};s.messages=[{id:'u',by:'you',text:'Hello'},{id:'a',by:'ai',text:'Old reply'}];save();});
+ reply='Retry result';await p.evaluate(()=>v3RerollRp(1));
+ reply='Continuation';await p.evaluate(()=>v3ContinueRp());
+ reply='Narration';await p.evaluate(()=>v3SwitchNarrator());
+ assert.deepEqual(await p.evaluate(()=>CreationWorkflow.getRp(ui.rpSessionId).messages.map(m=>m.text)),['Hello','Retry result','Continuation','Narration']);
+ const parent=await p.evaluate(()=>ui.rpSessionId);
+ reply='Branch retry';await p.evaluate(()=>v3RerollRp(1));
+ assert.notEqual(await p.evaluate(()=>ui.rpSessionId),parent);
+ assert.equal(await p.evaluate(id=>CreationWorkflow.getRp(id).messages.length,parent),4);
+ assert.equal(await p.evaluate(()=>CreationWorkflow.getRp(ui.rpSessionId).messages.at(-1).text),'Branch retry');
+ console.log('PASS RP retry/continue/narrator and historical retry branch');
+ const before=await p.evaluate(()=>JSON.stringify(CreationWorkflow.getRp(ui.rpSessionId).messages));
+ reply='';await p.evaluate(()=>v3RerollRp(1));
+ assert.equal(await p.evaluate(()=>JSON.stringify(CreationWorkflow.getRp(ui.rpSessionId).messages)),before);
+ await p.evaluate(()=>visit('concept'));
+ const cards=await p.evaluate(()=>JSON.stringify(ConceptWorkbench.getState().candidates));
+ reply='invalid json';await p.locator('#generateBtn').click();
+ await p.waitForFunction(()=>!document.getElementById('generateBtn').disabled);
+ assert.equal(await p.evaluate(()=>JSON.stringify(ConceptWorkbench.getState().candidates)),cards);
+ await p.screenshot({path:path.join(root,'test-results','direct-ai-candidates.png')});
+ await p.reload();await p.waitForFunction(()=>window.CreationWorkflow&&window.ConceptWorkbench);
+ assert.equal(await p.evaluate(()=>JSON.stringify(ConceptWorkbench.getState().candidates)),cards);
+ console.log('PASS generation failures preserve originals and candidate reload persistence');
+})().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{if(app)await app.close();if(server)server.close();});
+
+
